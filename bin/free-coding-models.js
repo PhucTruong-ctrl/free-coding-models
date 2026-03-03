@@ -99,6 +99,7 @@ import { getAvg, getVerdict, getUptime, getP95, getJitter, getStabilityScore, so
 import { loadConfig, saveConfig, getApiKey, resolveApiKeys, isProviderEnabled, saveAsProfile, loadProfile, listProfiles, deleteProfile, getActiveProfileName, setActiveProfile, _emptyProfileSettings } from '../lib/config.js'
 import { buildMergedModels } from '../lib/model-merger.js'
 import { ProxyServer } from '../lib/proxy-server.js'
+import { loadOpenCodeConfig, saveOpenCodeConfig, syncToOpenCode, restoreOpenCodeBackup } from '../lib/opencode-sync.js'
 
 // 📖 mergedModels: cross-provider grouped model list (one entry per label, N providers each)
 // 📖 mergedModelByLabel: fast lookup map from display label → merged model entry
@@ -740,6 +741,13 @@ const OVERLAY_PANEL_WIDTH = 116
 // 📖 Strip ANSI color/control sequences to estimate visible text width before padding.
 function stripAnsi(input) {
   return String(input).replace(/\x1b\[[0-9;]*m/g, '').replace(/\x1b\][^\x1b]*\x1b\\/g, '')
+}
+
+// 📖 maskApiKey: Mask all but first 4 and last 3 characters of an API key.
+// 📖 Prevents accidental disclosure of secrets in TUI display.
+function maskApiKey(key) {
+  if (!key || key.length < 10) return '***'
+  return key.slice(0, 4) + '***' + key.slice(-3)
 }
 
 // 📖 Calculate display width of a string in terminal columns.
@@ -1626,25 +1634,6 @@ async function resolveOpenCodeTmuxPort() {
 
 function getOpenCodeConfigPath() {
   return OPENCODE_CONFIG
-}
-
-function loadOpenCodeConfig() {
-  const configPath = getOpenCodeConfigPath()
-  if (!existsSync(configPath)) return { provider: {} }
-  try {
-    return JSON.parse(readFileSync(configPath, 'utf8'))
-  } catch {
-    return { provider: {} }
-  }
-}
-
-function saveOpenCodeConfig(config) {
-  const configPath = getOpenCodeConfigPath()
-  const dir = dirname(configPath)
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true })
-  }
-  writeFileSync(configPath, JSON.stringify(config, null, 2))
 }
 
 // ─── Shared OpenCode spawn helper ──────────────────────────────────────────────
@@ -2951,6 +2940,8 @@ async function main() {
     bugReportBuffer: '',          // 📖 Typed characters for the bug report message
     bugReportStatus: 'idle',      // 📖 'idle'|'sending'|'success'|'error' — webhook send status
     bugReportError: null,         // 📖 Last webhook error message
+    // 📖 OpenCode sync status (S key in settings)
+    settingsSyncStatus: null,     // 📖 { type: 'success'|'error', msg: string } — shown in settings footer
   }
 
   // 📖 Re-clamp viewport on terminal resize
@@ -3131,7 +3122,12 @@ async function main() {
     if (state.settingsEditMode) {
       lines.push(chalk.dim('  Type API key  •  Enter Save  •  Esc Cancel'))
     } else {
-      lines.push(chalk.dim('  ↑↓ Navigate  •  Enter Edit key / Toggle / Load profile  •  Space Toggle  •  T Test key  •  U Updates  •  ⌫ Delete profile  •  Esc Close'))
+      lines.push(chalk.dim('  ↑↓ Navigate  •  Enter Edit key  •  + Add key  •  - Remove key  •  Space Toggle  •  T Test key  •  S Sync→OpenCode  •  R Restore backup  •  U Updates  •  ⌫ Delete profile  •  Esc Close'))
+    }
+    // 📖 Show sync/restore status message if set
+    if (state.settingsSyncStatus) {
+      const { type, msg } = state.settingsSyncStatus
+      lines.push(type === 'success' ? chalk.greenBright(`  ${msg}`) : chalk.yellow(`  ${msg}`))
     }
     lines.push('')
 
@@ -4074,6 +4070,7 @@ async function main() {
       if (key.name === 'escape' || key.name === 'p') {
         // 📖 Close settings — rebuild results to reflect provider changes
         state.settingsOpen = false
+        state.settingsSyncStatus = null  // 📖 Clear sync status on close
         // 📖 Rebuild results: add models from newly enabled providers, remove disabled
         results = MODELS
           .filter(([,,,,,pk]) => isProviderEnabled(state.config, pk))
@@ -4234,6 +4231,54 @@ async function main() {
       }
 
       if (key.ctrl && key.name === 'c') { exit(0); return }
+
+      // 📖 S key: sync FCM provider entries to OpenCode config (merge, don't replace)
+      if (key.name === 's' && !key.shift && !key.ctrl) {
+        try {
+          const proxyStatus = activeProxy?.getStatus?.()
+          const result = syncToOpenCode(state.config, sources, mergedModels, {
+            useProxy: !!activeProxy,
+            proxyPort: proxyStatus?.port,
+          })
+          state.settingsSyncStatus = { type: 'success', msg: `✅ Synced ${result.providersAdded} provider(s) to OpenCode` }
+        } catch (err) {
+          state.settingsSyncStatus = { type: 'error', msg: `❌ Sync failed: ${err.message}` }
+        }
+        return
+      }
+
+      // 📖 R key: restore OpenCode config from backup (opencode.json.bak)
+      if (key.name === 'r' && !key.shift && !key.ctrl) {
+        try {
+          const restored = restoreOpenCodeBackup()
+          state.settingsSyncStatus = restored
+            ? { type: 'success', msg: '✅ OpenCode config restored from backup' }
+            : { type: 'error', msg: '⚠  No backup found (opencode.json.bak)' }
+        } catch (err) {
+          state.settingsSyncStatus = { type: 'error', msg: `❌ Restore failed: ${err.message}` }
+        }
+        return
+      }
+
+      // 📖 + key: add/edit API key for the selected provider (alias for Enter on provider rows)
+      if ((str === '+' || key.name === '+') && state.settingsCursor < providerKeys.length) {
+        const pk = providerKeys[state.settingsCursor]
+        state.settingsEditBuffer = state.config.apiKeys?.[pk] ?? ''
+        state.settingsEditMode = true
+        return
+      }
+
+      // 📖 - key: remove API key for the selected provider
+      if ((str === '-' || key.name === '-') && state.settingsCursor < providerKeys.length) {
+        const pk = providerKeys[state.settingsCursor]
+        if (state.config.apiKeys) {
+          delete state.config.apiKeys[pk]
+          saveConfig(state.config)
+          state.settingsSyncStatus = { type: 'success', msg: `✅ Removed API key for ${pk}` }
+        }
+        return
+      }
+
       return // 📖 Swallow all other keys while settings is open
     }
 
