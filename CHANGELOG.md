@@ -19,6 +19,12 @@
 - **TUI proxy controls** — **X** key starts/stops the embedded proxy server; proxy address and live token-usage counters are shown in the status bar while the proxy is running.
 - **Merged model view** — the main model table can now display cross-provider merged entries, showing all available provider variants for a model in a single row.
 
+### Fixed
+
+- **Alibaba Cloud URL** -- updated from deprecated `dashscope.console.alibabacloud.com` to active `modelstudio.console.alibabacloud.com` (rebranded to Model Studio).
+- **SambaNova URL** -- updated from broken `sambanova.ai/developers` to active `cloud.sambanova.ai/apis` (SambaCloud portal).
+- **OpenRouter key corruption** -- added validation to detect and prevent saving OpenRouter keys that don't start with `sk-or-` prefix. Shows error message and cancels save if corruption detected.
+
 ---
 
 ## 0.1.81
