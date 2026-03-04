@@ -95,7 +95,7 @@ import { createServer as createHttpServer } from 'http'
 import { request as httpsRequest } from 'https'
 import { MODELS, sources } from '../sources.js'
 import { patchOpenClawModelsJson } from '../patch-openclaw-models.js'
-import { getAvg, getVerdict, getUptime, getP95, getJitter, getStabilityScore, sortResults, filterByTier, findBestModel, parseArgs, TIER_ORDER, VERDICT_ORDER, TIER_LETTER_MAP, scoreModelForTask, getTopRecommendations, TASK_TYPES, PRIORITY_TYPES, CONTEXT_BUDGETS, formatCtxWindow, labelFromId } from '../lib/utils.js'
+import { getAvg, getVerdict, getUptime, getP95, getJitter, getStabilityScore, sortResults, filterByTier, findBestModel, parseArgs, TIER_ORDER, VERDICT_ORDER, TIER_LETTER_MAP, scoreModelForTask, getTopRecommendations, TASK_TYPES, PRIORITY_TYPES, CONTEXT_BUDGETS, formatCtxWindow, labelFromId, getProxyStatusInfo } from '../lib/utils.js'
 import { loadConfig, saveConfig, getApiKey, resolveApiKeys, addApiKey, removeApiKey, isProviderEnabled, saveAsProfile, loadProfile, listProfiles, deleteProfile, getActiveProfileName, setActiveProfile, _emptyProfileSettings } from '../lib/config.js'
 import { buildMergedModels } from '../lib/model-merger.js'
 import { ProxyServer } from '../lib/proxy-server.js'
@@ -883,8 +883,29 @@ function sortResultsWithPinnedFavorites(results, sortColumn, sortDirection) {
   return [...bothRows, ...recommendedRows, ...favoriteRows, ...nonSpecialRows]
 }
 
+// 📖 renderProxyStatusLine: Maps proxyStartupStatus + active proxy into a chalk-coloured footer line.
+// 📖 Always returns a non-empty string (no hidden states) so the footer row is always present.
+// 📖 Delegates state classification to the pure getProxyStatusInfo helper (testable in utils.js).
+function renderProxyStatusLine(proxyStartupStatus, proxyInstance) {
+  const info = getProxyStatusInfo(proxyStartupStatus, !!proxyInstance)
+  switch (info.state) {
+    case 'starting':
+      return chalk.dim('  ') + chalk.yellow('⟳ Proxy') + chalk.dim(' starting…')
+    case 'running': {
+      const portPart  = info.port        ? chalk.dim(` :${info.port}`) : ''
+      const acctPart  = info.accountCount != null ? chalk.dim(` · ${info.accountCount} account${info.accountCount === 1 ? '' : 's'}`) : ''
+      return chalk.dim('  ') + chalk.rgb(57, 255, 20)('🔀 Proxy') + chalk.rgb(57, 255, 20)(' running') + portPart + acctPart
+    }
+    case 'failed':
+      return chalk.dim('  ') + chalk.red('✗ Proxy failed') + chalk.dim(` — ${info.reason}`)
+    default:
+      // stopped / not configured — dim but always present
+      return chalk.dim('  🔀 Proxy not configured')
+  }
+}
+
 // 📖 renderTable: mode param controls footer hint text (opencode vs openclaw)
-function renderTable(results, pendingPings, frame, cursor = null, sortColumn = 'avg', sortDirection = 'asc', pingInterval = PING_INTERVAL, lastPingTime = Date.now(), mode = 'opencode', tierFilterMode = 0, scrollOffset = 0, terminalRows = 0, originFilterMode = 0, activeProfile = null, profileSaveMode = false, profileSaveBuffer = '') {
+function renderTable(results, pendingPings, frame, cursor = null, sortColumn = 'avg', sortDirection = 'asc', pingInterval = PING_INTERVAL, lastPingTime = Date.now(), mode = 'opencode', tierFilterMode = 0, scrollOffset = 0, terminalRows = 0, originFilterMode = 0, activeProfile = null, profileSaveMode = false, profileSaveBuffer = '', proxyStartupStatus = null) {
   // 📖 Filter out hidden models for display
   const visibleResults = results.filter(r => !r.hidden)
 
@@ -1308,12 +1329,8 @@ function renderTable(results, pendingPings, frame, cursor = null, sortColumn = '
   lines.push(chalk.dim(`  ↑↓ Navigate  •  `) + actionHint + chalk.dim(`  •  `) + chalk.yellow('F') + chalk.dim(` Favorite  •  R/Y/O/M/L/A/S/C/H/V/B/U/`) + chalk.yellow('G') + chalk.dim(` Sort  •  `) + chalk.yellow('T') + chalk.dim(` Tier  •  `) + chalk.yellow('N') + chalk.dim(` Origin  •  W↓/=↑ (${intervalSec}s)  •  `) + chalk.rgb(255, 100, 50).bold('Z') + chalk.dim(` Mode  •  `) + chalk.yellow('X') + chalk.dim(` Logs  •  `) + chalk.yellow('P') + chalk.dim(` Settings  •  `) + chalk.rgb(0, 255, 80).bold('K') + chalk.dim(` Help`))
   // 📖 Line 2: profiles, recommend, feature request, bug report, and extended hints — gives visibility to less-obvious features
   lines.push(chalk.dim(`  `) + chalk.rgb(200, 150, 255).bold('⇧P') + chalk.dim(` Cycle profile  •  `) + chalk.rgb(200, 150, 255).bold('⇧S') + chalk.dim(` Save profile  •  `) + chalk.rgb(0, 200, 180).bold('Q') + chalk.dim(` Smart Recommend  •  `) + chalk.rgb(57, 255, 20).bold('J') + chalk.dim(` Request feature  •  `) + chalk.rgb(255, 87, 51).bold('I') + chalk.dim(` Report bug  •  `) + chalk.yellow('E') + chalk.dim(`/`) + chalk.yellow('D') + chalk.dim(` Tier ↑↓  •  `) + chalk.yellow('Esc') + chalk.dim(` Close overlay  •  Ctrl+C Exit`))
-  // 📖 Proxy status line — shown when multi-account rotation proxy is active; empty otherwise
-  if (activeProxy) {
-    lines.push(chalk.dim('  ') + chalk.rgb(57, 255, 20)('🔀 Proxy') + chalk.dim(' running  •  multi-account rotation active'))
-  } else {
-    lines.push('')
-  }
+  // 📖 Proxy status line — always rendered with explicit state (starting/running/failed/stopped)
+  lines.push(renderProxyStatusLine(proxyStartupStatus, activeProxy))
   lines.push(
     chalk.rgb(255, 150, 200)('  Made with 💖 & ☕ by \x1b]8;;https://github.com/vava-nessa\x1b\\vava-nessa\x1b]8;;\x1b\\') +
     chalk.dim('  •  ') +
@@ -2295,6 +2312,49 @@ async function ensureProxyRunning(fcmConfig, { forceRestart = false } = {}) {
   return { port, accountCount: accounts.length, proxyToken, proxyModels, availableModelSlugs }
 }
 
+// 📖 autoStartProxyIfSynced: Fire-and-forget startup orchestrator.
+// 📖 Reads OpenCode config; if fcm-proxy provider is present, starts the proxy.
+// 📖 Updates state.proxyStartupStatus with explicit transitions:
+// 📖   'starting' → 'running' (with port/accountCount) or 'failed' (with reason).
+// 📖 After the proxy starts, rewrites opencode.json with the runtime port/token so
+// 📖 OpenCode immediately points to the live proxy (not a stale persisted value).
+// 📖 Non-FCM providers and other top-level keys are preserved by mergeOcConfig.
+// 📖 Never throws — must not crash startup.
+async function autoStartProxyIfSynced(fcmConfig, state) {
+  try {
+    const ocConfig = loadOpenCodeConfig()
+    if (!ocConfig?.provider?.['fcm-proxy']) {
+      // 📖 No synced fcm-proxy entry — nothing to auto-start.
+      return
+    }
+
+    state.proxyStartupStatus = { phase: 'starting' }
+
+    const started = await ensureProxyRunning(fcmConfig)
+
+    // 📖 Rewrite opencode.json with the runtime port/token assigned by the OS.
+    // 📖 This is safe: mergeOcConfig (called inside syncToOpenCode) preserves all
+    // 📖 non-FCM providers (anthropic, openai, google, etc.) and other top-level
+    // 📖 keys ($schema, mcp, plugin, command, model).
+    syncToOpenCode(fcmConfig, sources, mergedModels, {
+      proxyPort: started.port,
+      proxyToken: started.proxyToken,
+      availableModelSlugs: started.availableModelSlugs,
+    })
+
+    state.proxyStartupStatus = {
+      phase: 'running',
+      port: started.port,
+      accountCount: started.accountCount,
+    }
+  } catch (err) {
+    state.proxyStartupStatus = {
+      phase: 'failed',
+      reason: err?.message ?? String(err),
+    }
+  }
+}
+
 async function startProxyAndLaunch(model, fcmConfig) {
   try {
     const started = await ensureProxyRunning(fcmConfig, { forceRestart: true })
@@ -3127,6 +3187,12 @@ async function main() {
     // 📖 Log page overlay state (X key opens it)
     logVisible: false,            // 📖 Whether the log page overlay is active
     logScrollOffset: 0,           // 📖 Vertical scroll offset for log overlay viewport
+    // 📖 Proxy startup status — set by autoStartProxyIfSynced, consumed by Task 3 indicator
+    // 📖 null = not configured/not attempted
+    // 📖 { phase: 'starting' } — proxy start in progress
+    // 📖 { phase: 'running', port, accountCount } — proxy is live
+    // 📖 { phase: 'failed', reason } — proxy failed to start
+    proxyStartupStatus: null,     // 📖 Startup-phase proxy status (null | { phase, ...details })
   }
 
   // 📖 Re-clamp viewport on terminal resize
@@ -3134,6 +3200,12 @@ async function main() {
     state.terminalRows = process.stdout.rows || 24
     adjustScrollOffset(state)
   })
+
+  // 📖 Auto-start proxy on launch if OpenCode config already has an fcm-proxy provider.
+  // 📖 Fire-and-forget: does not block UI startup. state.proxyStartupStatus is updated async.
+  if (mode === 'opencode' || mode === 'opencode-desktop') {
+    void autoStartProxyIfSynced(config, state)
+  }
 
   // 📖 Enter alternate screen — animation runs here, zero scrollback pollution
   process.stdout.write(ALT_ENTER)
@@ -4948,7 +5020,7 @@ async function main() {
               ? renderHelp()
               : state.logVisible
                 ? renderLog()
-                : renderTable(state.results, state.pendingPings, state.frame, state.cursor, state.sortColumn, state.sortDirection, state.pingInterval, state.lastPingTime, state.mode, tierFilterMode, state.scrollOffset, state.terminalRows, originFilterMode, state.activeProfile, state.profileSaveMode, state.profileSaveBuffer)
+                : renderTable(state.results, state.pendingPings, state.frame, state.cursor, state.sortColumn, state.sortDirection, state.pingInterval, state.lastPingTime, state.mode, tierFilterMode, state.scrollOffset, state.terminalRows, originFilterMode, state.activeProfile, state.profileSaveMode, state.profileSaveBuffer, state.proxyStartupStatus)
     process.stdout.write(ALT_HOME + content)
   }, Math.round(1000 / FPS))
 
@@ -4956,7 +5028,7 @@ async function main() {
   const initialVisible = state.results.filter(r => !r.hidden)
   state.visibleSorted = sortResultsWithPinnedFavorites(initialVisible, state.sortColumn, state.sortDirection)
 
-  process.stdout.write(ALT_HOME + renderTable(state.results, state.pendingPings, state.frame, state.cursor, state.sortColumn, state.sortDirection, state.pingInterval, state.lastPingTime, state.mode, tierFilterMode, state.scrollOffset, state.terminalRows, originFilterMode, state.activeProfile, state.profileSaveMode, state.profileSaveBuffer))
+  process.stdout.write(ALT_HOME + renderTable(state.results, state.pendingPings, state.frame, state.cursor, state.sortColumn, state.sortDirection, state.pingInterval, state.lastPingTime, state.mode, tierFilterMode, state.scrollOffset, state.terminalRows, originFilterMode, state.activeProfile, state.profileSaveMode, state.profileSaveBuffer, state.proxyStartupStatus))
 
   // 📖 If --recommend was passed, auto-open the Smart Recommend overlay on start
   if (cliArgs.recommendMode) {

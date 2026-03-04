@@ -15,7 +15,7 @@
 
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { sortResults } from '../lib/utils.js'
+import { sortResults, getProxyStatusInfo } from '../lib/utils.js'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -223,5 +223,56 @@ describe('tui-hotkeys – = key interval increase (reassigned from X)', () => {
     // These are modal keys that = must not conflict with
     const modalKeys = ['t','n','f','j','i','p','q','z','k','w','x','e','d']
     assert.ok(!modalKeys.includes('='), '= is not already a modal key')
+  })
+})
+
+// ─── Suite: proxy status indicator — getProxyStatusInfo ──────────────────────
+
+describe('tui-hotkeys – proxy status indicator (getProxyStatusInfo)', () => {
+  it('returns "stopped" state when proxyStartupStatus is null and proxy is not active', () => {
+    const info = getProxyStatusInfo(null, false)
+    assert.strictEqual(info.state, 'stopped')
+  })
+
+  it('returns "starting" state when proxyStartupStatus phase is "starting"', () => {
+    const info = getProxyStatusInfo({ phase: 'starting' }, false)
+    assert.strictEqual(info.state, 'starting')
+  })
+
+  it('"running" state carries port and accountCount from proxyStartupStatus', () => {
+    const info = getProxyStatusInfo({ phase: 'running', port: 4891, accountCount: 3 }, true)
+    assert.strictEqual(info.state, 'running')
+    assert.strictEqual(info.port, 4891)
+    assert.strictEqual(info.accountCount, 3)
+  })
+
+  it('"running" state falls back to "active" when proxyStartupStatus is null but activeProxy is true', () => {
+    const info = getProxyStatusInfo(null, true)
+    assert.strictEqual(info.state, 'running')
+  })
+
+  it('"failed" state carries a short reason string', () => {
+    const info = getProxyStatusInfo({ phase: 'failed', reason: 'EADDRINUSE: port in use' }, false)
+    assert.strictEqual(info.state, 'failed')
+    assert.ok(typeof info.reason === 'string', 'reason should be a string')
+    assert.ok(info.reason.length > 0, 'reason should be non-empty')
+  })
+
+  it('"failed" reason is truncated to 80 chars maximum', () => {
+    const longReason = 'x'.repeat(200)
+    const info = getProxyStatusInfo({ phase: 'failed', reason: longReason }, false)
+    assert.ok(info.reason.length <= 80, `reason should be ≤80 chars, got ${info.reason.length}`)
+  })
+
+  it('proxyStartupStatus "running" takes priority over null activeProxy', () => {
+    // Even if activeProxy object is falsy, a running startup status is authoritative
+    const info = getProxyStatusInfo({ phase: 'running', port: 5000, accountCount: 2 }, false)
+    assert.strictEqual(info.state, 'running')
+    assert.strictEqual(info.port, 5000)
+  })
+
+  it('returns "stopped" for unrecognized phase', () => {
+    const info = getProxyStatusInfo({ phase: 'unknown' }, false)
+    assert.strictEqual(info.state, 'stopped')
   })
 })

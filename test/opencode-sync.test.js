@@ -6,6 +6,9 @@
  *   1. Single-provider merge preservation (non-FCM providers are untouched)
  *   2. Runtime proxy values (port/token) used only when proxy is running
  *   3. Fallback to existing persisted provider options when proxy is not running
+ *   4. Startup autostart runtime rewrite (Task 2) — after proxy starts on an OS-assigned
+ *      port, the opencode.json must be rewritten with the actual runtime port/token so
+ *      OpenCode immediately points to the live proxy (not a stale persisted value).
  *
  * Uses the pure mergeOcConfig() function which performs the merge without I/O,
  * allowing full unit-test coverage without filesystem setup.
@@ -454,5 +457,115 @@ describe('mergeOcConfig — availableModelSlugs filtering', () => {
     assert.ok(fcmModels['m7'])
     assert.ok(!fcmModels['m1'])
     assert.ok(!fcmModels['m9'])
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 📖 5. STARTUP AUTOSTART RUNTIME REWRITE (Task 2)
+//
+// When the proxy auto-starts on startup, ensureProxyRunning() binds to an
+// OS-assigned port (because port 0 is used). The resulting port is not known
+// until bind completes. autoStartProxyIfSynced() must call syncToOpenCode()
+// with the live port/token so opencode.json is immediately up-to-date.
+//
+// These tests assert the expected end-state of that rewrite via the pure
+// mergeOcConfig() function — the same function called by syncToOpenCode().
+// ═══════════════════════════════════════════════════════════════════════════════
+describe('mergeOcConfig — startup autostart runtime rewrite (Task 2)', () => {
+  it('overwrites a stale persisted port with the OS-assigned runtime port', () => {
+    // opencode.json has port 8045 from a previous session
+    const oc = {
+      provider: {
+        'fcm-proxy': {
+          options: { baseURL: 'http://127.0.0.1:8045/v1', apiKey: 'old-tok' },
+          models: {},
+        },
+      },
+    }
+    // Proxy bound to OS-assigned port 52341 at startup
+    mergeOcConfig(oc, mockMergedModels(2), { proxyPort: 52341, proxyToken: 'startup-tok' })
+    assert.equal(
+      oc.provider['fcm-proxy'].options.baseURL,
+      'http://127.0.0.1:52341/v1',
+      'Runtime port must overwrite the stale persisted port'
+    )
+  })
+
+  it('overwrites a stale persisted token with the runtime token from the started proxy', () => {
+    const oc = {
+      provider: {
+        'fcm-proxy': {
+          options: { baseURL: 'http://127.0.0.1:8045/v1', apiKey: 'stale-session-tok' },
+          models: {},
+        },
+      },
+    }
+    mergeOcConfig(oc, mockMergedModels(2), { proxyPort: 49800, proxyToken: 'fresh-startup-tok' })
+    assert.equal(
+      oc.provider['fcm-proxy'].options.apiKey,
+      'fresh-startup-tok',
+      'Runtime token must overwrite the stale persisted token'
+    )
+  })
+
+  it('preserves all non-FCM providers after the startup runtime rewrite', () => {
+    // opencode.json has anthropic + fcm-proxy with stale values
+    const oc = {
+      $schema: 'https://opencode.ai/config.schema.json',
+      model: 'anthropic/claude-opus-4-5',
+      provider: {
+        'anthropic': { name: 'Anthropic', options: { apiKey: 'sk-ant-abc' } },
+        'google':    { name: 'Google',    options: { apiKey: 'goog-xyz' } },
+        'fcm-proxy': { options: { baseURL: 'http://127.0.0.1:8045/v1', apiKey: 'old-tok' }, models: {} },
+      },
+      mcp: { server: {} },
+    }
+    mergeOcConfig(oc, mockMergedModels(3), { proxyPort: 51000, proxyToken: 'new-tok' })
+
+    // Non-FCM providers must survive untouched
+    assert.ok(oc.provider['anthropic'], 'anthropic must be preserved')
+    assert.equal(oc.provider['anthropic'].options.apiKey, 'sk-ant-abc')
+    assert.ok(oc.provider['google'], 'google must be preserved')
+    assert.equal(oc.provider['google'].options.apiKey, 'goog-xyz')
+
+    // Top-level keys untouched
+    assert.equal(oc.$schema, 'https://opencode.ai/config.schema.json')
+    assert.equal(oc.model, 'anthropic/claude-opus-4-5')
+    assert.ok(oc.mcp)
+
+    // FCM proxy has updated values
+    assert.equal(oc.provider['fcm-proxy'].options.baseURL, 'http://127.0.0.1:51000/v1')
+    assert.equal(oc.provider['fcm-proxy'].options.apiKey, 'new-tok')
+  })
+
+  it('writes the runtime port even on first-run (no prior fcm-proxy entry)', () => {
+    // First time user syncs — no existing fcm-proxy provider in opencode.json
+    const oc = {
+      provider: {
+        'anthropic': { options: { apiKey: 'sk-ant' } },
+      },
+    }
+    mergeOcConfig(oc, mockMergedModels(2), { proxyPort: 43210, proxyToken: 'first-run-tok' })
+    assert.equal(oc.provider['fcm-proxy'].options.baseURL, 'http://127.0.0.1:43210/v1')
+    assert.equal(oc.provider['fcm-proxy'].options.apiKey, 'first-run-tok')
+    // Non-FCM untouched
+    assert.ok(oc.provider['anthropic'])
+  })
+
+  it('runtime rewrite includes all available model slugs', () => {
+    const oc = { provider: { 'fcm-proxy': { options: { baseURL: 'http://127.0.0.1:8045/v1', apiKey: 'tok' }, models: {} } } }
+    const models = [
+      { slug: 'nim-llama', label: 'Llama 3.3' },
+      { slug: 'groq-llama', label: 'Llama 3.1 (Groq)' },
+      { slug: 'cerebras-llama', label: 'Llama 3.3 (Cerebras)' },
+    ]
+    const available = new Set(['nim-llama', 'groq-llama'])
+    mergeOcConfig(oc, models, { proxyPort: 55555, proxyToken: 'run-tok', availableModelSlugs: available })
+
+    const fcmModels = oc.provider['fcm-proxy'].models
+    assert.ok(fcmModels['nim-llama'],   'nim-llama should be in models')
+    assert.ok(fcmModels['groq-llama'],  'groq-llama should be in models')
+    assert.ok(!fcmModels['cerebras-llama'], 'cerebras-llama (no key) should be excluded')
+    assert.equal(oc.provider['fcm-proxy'].options.baseURL, 'http://127.0.0.1:55555/v1')
   })
 })
